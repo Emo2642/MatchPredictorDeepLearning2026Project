@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Dataset (download separately from Kaggle)
+database.sqlite
+*.sqlite
+*.db
+
+# Generated model files
+*.h5
+*.keras
+
+# Generated visualisation outputs
+*.png
+*.jpg
+*.jpeg
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
