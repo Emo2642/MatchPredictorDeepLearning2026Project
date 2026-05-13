@@ -59,6 +59,16 @@ python match_predictor.py
 
 ---
 
+## Streamlit UI
+
+Run the interactive UI with team search and date picker:
+
+```bash
+streamlit run app.py
+```
+
+---
+
 ## Features Engineered
 
 For each match, the following features are computed from the **last 20 matches** for each team:
