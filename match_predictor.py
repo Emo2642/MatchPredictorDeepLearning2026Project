@@ -17,11 +17,17 @@
 # =============================================================================
 
 # ---------------------------------------------------------------------------
-# Top-level flag: set to True to use the real Kaggle SQLite database,
-#                 set to False to run on 100 synthetic samples (demo mode).
+# Top-level flags:
+#   - USE_FULL_DATASET: load Kaggle SQLite database
+#   - USE_CSV:          load a flat CSV file
+#   - If both are False (or files missing), use synthetic demo data.
 # ---------------------------------------------------------------------------
 USE_FULL_DATASET = False
+USE_CSV = True
+USE_ELO_RATINGS = True
 DATABASE_PATH = "database.sqlite"   # path to the Kaggle SQLite file
+CSV_PATH = "Matches_Top5_TR_2015_2025.csv"            # path to a CSV file in project root
+ELO_RATINGS_PATH = "EloRatings_Top5_TR_2015_2025.csv"  # optional Elo ratings CSV
 
 # =============================================================================
 # SECTION 1 — Imports and Setup
@@ -119,6 +125,207 @@ def load_real_data(db_path: str) -> pd.DataFrame:
     return df
 
 
+def load_csv_data(csv_path: str) -> pd.DataFrame:
+    """
+    Load a flat CSV file and normalize column names to expected schema.
+    Required columns (or aliases):
+      date, home_team_api_id, away_team_api_id, home_team_goal, away_team_goal
+    """
+    df = pd.read_csv(csv_path)
+
+    # Preserve team names if present to avoid numeric-only IDs in UI.
+    if "HomeTeam" in df.columns:
+        df["home_team_name"] = df["HomeTeam"].astype(str)
+    if "AwayTeam" in df.columns:
+        df["away_team_name"] = df["AwayTeam"].astype(str)
+
+    column_aliases = {
+        "date": ["date", "match_date", "game_date", "MatchDate"],
+        "home_team_api_id": [
+            "home_team_api_id", "home_team_id", "home_id",
+            "home_team", "HomeTeam", "home"
+        ],
+        "away_team_api_id": [
+            "away_team_api_id", "away_team_id", "away_id",
+            "away_team", "AwayTeam", "away"
+        ],
+        "home_team_goal": [
+            "home_team_goal", "home_goals", "home_goal",
+            "home_score", "FTHG", "FTHome"
+        ],
+        "away_team_goal": [
+            "away_team_goal", "away_goals", "away_goal",
+            "away_score", "FTAG", "FTAway"
+        ],
+    }
+
+    optional_aliases = {
+        "h_elo": ["HomeElo", "home_elo"],
+        "a_elo": ["AwayElo", "away_elo"],
+        "h_form3": ["Form3Home", "form3_home"],
+        "h_form5": ["Form5Home", "form5_home"],
+        "a_form3": ["Form3Away", "form3_away"],
+        "a_form5": ["Form5Away", "form5_away"],
+        "odd_home": ["OddHome", "odd_home"],
+        "odd_draw": ["OddDraw", "odd_draw"],
+        "odd_away": ["OddAway", "odd_away"],
+        "max_home": ["MaxHome", "max_home"],
+        "max_draw": ["MaxDraw", "max_draw"],
+        "max_away": ["MaxAway", "max_away"],
+        "over25": ["Over25", "over25"],
+        "under25": ["Under25", "under25"],
+        "max_over25": ["MaxOver25", "max_over25"],
+        "max_under25": ["MaxUnder25", "max_under25"],
+        "handi_size": ["HandiSize", "handi_size"],
+        "handi_home": ["HandiHome", "handi_home"],
+        "handi_away": ["HandiAway", "handi_away"],
+    }
+
+    rename_map = {}
+    for target, aliases in column_aliases.items():
+        if target in df.columns:
+            continue
+        for alias in aliases:
+            if alias in df.columns:
+                rename_map[alias] = target
+                break
+
+    for target, aliases in optional_aliases.items():
+        if target in df.columns:
+            continue
+        for alias in aliases:
+            if alias in df.columns:
+                rename_map[alias] = target
+                break
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    if "home_team_name" in df.columns:
+        df["home_team_api_id"] = df["home_team_name"]
+    if "away_team_name" in df.columns:
+        df["away_team_api_id"] = df["away_team_name"]
+
+    required = [
+        "date", "home_team_api_id", "away_team_api_id",
+        "home_team_goal", "away_team_goal"
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            "CSV is missing required columns: " + ", ".join(missing)
+        )
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["home_team_goal"] = pd.to_numeric(df["home_team_goal"], errors="coerce")
+    df["away_team_goal"] = pd.to_numeric(df["away_team_goal"], errors="coerce")
+
+    df = df.dropna(subset=required).copy()
+    df["home_team_api_id"] = df["home_team_api_id"].astype(str)
+    df["away_team_api_id"] = df["away_team_api_id"].astype(str)
+
+    if "match_id" not in df.columns:
+        df["match_id"] = np.arange(len(df))
+    if "season" not in df.columns:
+        df["season"] = df["date"].dt.year.astype(str)
+
+    if USE_ELO_RATINGS and os.path.exists(ELO_RATINGS_PATH):
+        df = merge_elo_ratings(df, ELO_RATINGS_PATH)
+    elif USE_ELO_RATINGS:
+        print(
+            f"WARNING: {ELO_RATINGS_PATH} not found. "
+            "Continuing without Elo merge."
+        )
+
+    numeric_cols = [
+        "h_speed", "h_passing", "h_chance_pass", "h_chance_cross",
+        "h_chance_shoot", "h_def_pressure", "h_def_aggression",
+        "h_def_width", "a_speed", "a_passing", "a_chance_pass",
+        "a_chance_cross", "a_chance_shoot", "a_def_pressure",
+        "a_def_aggression", "a_def_width",
+        "h_possession", "a_possession", "h_shots", "a_shots",
+        "h_shots_on_target", "a_shots_on_target", "h_fouls", "a_fouls",
+        "h_corners", "a_corners", "h_yellow_cards", "a_yellow_cards",
+        "h_red_cards", "a_red_cards",
+        "h_elo", "a_elo", "h_elo_hist", "a_elo_hist",
+        "h_form3", "h_form5", "a_form3", "a_form5",
+        "odd_home", "odd_draw", "odd_away", "max_home", "max_draw",
+        "max_away", "over25", "under25", "max_over25", "max_under25",
+        "handi_size", "handi_home", "handi_away",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.sort_values("date").reset_index(drop=True)
+    print(f"Loaded {len(df):,} matches from {csv_path}")
+    return df
+
+
+def merge_elo_ratings(df: pd.DataFrame, elo_path: str) -> pd.DataFrame:
+    """
+    Merge historical Elo ratings into the match DataFrame using the latest
+    rating at or before each match date.
+    """
+    elo_df = pd.read_csv(elo_path)
+
+    elo_aliases = {
+        "date": ["date", "Date"],
+        "club": ["club", "team", "Club", "Team"],
+        "elo": ["elo", "Elo", "rating", "Rating"],
+    }
+
+    rename_map = {}
+    for target, aliases in elo_aliases.items():
+        if target in elo_df.columns:
+            continue
+        for alias in aliases:
+            if alias in elo_df.columns:
+                rename_map[alias] = target
+                break
+
+    if rename_map:
+        elo_df = elo_df.rename(columns=rename_map)
+
+    required = ["date", "club", "elo"]
+    missing = [c for c in required if c not in elo_df.columns]
+    if missing:
+        raise ValueError(
+            "EloRatings CSV is missing required columns: " + ", ".join(missing)
+        )
+
+    elo_df = elo_df.dropna(subset=required).copy()
+    elo_df["date"] = pd.to_datetime(elo_df["date"], errors="coerce")
+    elo_df["club"] = elo_df["club"].astype(str)
+    elo_df["elo"] = pd.to_numeric(elo_df["elo"], errors="coerce")
+    elo_df = elo_df.dropna(subset=["date", "club", "elo"]).copy()
+    elo_df = elo_df.sort_values(["date", "club"])
+
+    home_key = df[["match_id", "date", "home_team_api_id"]].copy()
+    home_key = home_key.rename(columns={"home_team_api_id": "club"})
+    home_key = home_key.sort_values(["date", "club"])
+    home_elo = pd.merge_asof(
+        home_key, elo_df,
+        on="date", by="club", direction="backward",
+        allow_exact_matches=True
+    )
+    home_elo = home_elo[["match_id", "elo"]].rename(columns={"elo": "h_elo_hist"})
+
+    away_key = df[["match_id", "date", "away_team_api_id"]].copy()
+    away_key = away_key.rename(columns={"away_team_api_id": "club"})
+    away_key = away_key.sort_values(["date", "club"])
+    away_elo = pd.merge_asof(
+        away_key, elo_df,
+        on="date", by="club", direction="backward",
+        allow_exact_matches=True
+    )
+    away_elo = away_elo[["match_id", "elo"]].rename(columns={"elo": "a_elo_hist"})
+
+    df = df.merge(home_elo, on="match_id", how="left")
+    df = df.merge(away_elo, on="match_id", how="left")
+    return df
+
+
 def generate_synthetic_data(n_samples: int = 100) -> pd.DataFrame:
     """
     Generate a synthetic dataset that mirrors the structure of the Kaggle
@@ -192,9 +399,16 @@ def load_data() -> pd.DataFrame:
     """Entry point: load real or synthetic data based on the global flag."""
     if USE_FULL_DATASET and os.path.exists(DATABASE_PATH):
         return load_real_data(DATABASE_PATH)
+    if USE_CSV and os.path.exists(CSV_PATH):
+        return load_csv_data(CSV_PATH)
     if USE_FULL_DATASET:
         print(
             f"WARNING: {DATABASE_PATH} not found. "
+            "Falling back to synthetic data."
+        )
+    if USE_CSV:
+        print(
+            f"WARNING: {CSV_PATH} not found. "
             "Falling back to synthetic data."
         )
     return generate_synthetic_data(n_samples=100)
@@ -485,6 +699,17 @@ def build_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray, np
             feat[f"h_{k}"] = v
         for k, v in a_style_matchup.items():
             feat[f"a_{k}"] = v
+        # Optional pre-match features from CSV (if available)
+        pre_match_cols = [
+            "h_elo", "a_elo", "h_elo_hist", "a_elo_hist",
+            "h_form3", "h_form5", "a_form3", "a_form5",
+            "odd_home", "odd_draw", "odd_away", "max_home", "max_draw",
+            "max_away", "over25", "under25", "max_over25", "max_under25",
+            "handi_size", "handi_home", "handi_away",
+        ]
+        for col in pre_match_cols:
+            if col in row.index and not pd.isna(row[col]):
+                feat[col] = float(row[col])
         # Team attribute differentials (home minus away)
         for col in ["h_speed", "h_passing", "h_chance_pass",
                     "h_chance_cross", "h_chance_shoot",
@@ -500,6 +725,125 @@ def build_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray, np
     y_class = df["result"].values.astype(int)
     y_goals = df[["home_team_goal", "away_team_goal"]].values.astype(float)
     return feature_df, y_class, y_goals
+
+
+def _normalize_team_name(name: str) -> str:
+    return name.strip().lower()
+
+
+def _resolve_team_name(df: pd.DataFrame, name: str) -> str | None:
+    teams = pd.concat(
+        [df["home_team_api_id"], df["away_team_api_id"]]
+    ).dropna().astype(str)
+    unique = teams.unique().tolist()
+    lookup = {_normalize_team_name(t): t for t in unique}
+    key = _normalize_team_name(name)
+    if key in lookup:
+        return lookup[key]
+    suggestions = [t for t in unique if key in _normalize_team_name(t)]
+    if suggestions:
+        print("Did you mean one of these?", ", ".join(sorted(suggestions)[:10]))
+    return None
+
+
+def load_elo_ratings(elo_path: str) -> pd.DataFrame:
+    """Load and normalize Elo ratings CSV (date, club, elo)."""
+    elo_df = pd.read_csv(elo_path)
+    elo_aliases = {
+        "date": ["date", "Date"],
+        "club": ["club", "team", "Club", "Team"],
+        "elo": ["elo", "Elo", "rating", "Rating"],
+    }
+    rename_map = {}
+    for target, aliases in elo_aliases.items():
+        if target in elo_df.columns:
+            continue
+        for alias in aliases:
+            if alias in elo_df.columns:
+                rename_map[alias] = target
+                break
+    if rename_map:
+        elo_df = elo_df.rename(columns=rename_map)
+
+    required = ["date", "club", "elo"]
+    missing = [c for c in required if c not in elo_df.columns]
+    if missing:
+        raise ValueError(
+            "EloRatings CSV is missing required columns: " + ", ".join(missing)
+        )
+
+    elo_df = elo_df.dropna(subset=required).copy()
+    elo_df["date"] = pd.to_datetime(elo_df["date"], errors="coerce")
+    elo_df["club"] = elo_df["club"].astype(str)
+    elo_df["elo"] = pd.to_numeric(elo_df["elo"], errors="coerce")
+    elo_df = elo_df.dropna(subset=["date", "club", "elo"]).copy()
+    elo_df = elo_df.sort_values(["club", "date"])
+    return elo_df
+
+
+def _lookup_latest_elo(elo_df: pd.DataFrame, team: str, match_date: pd.Timestamp) -> float | None:
+    team_rows = elo_df[elo_df["club"] == team]
+    if team_rows.empty:
+        return None
+    eligible = team_rows[team_rows["date"] <= match_date]
+    if eligible.empty:
+        return None
+    return float(eligible.iloc[-1]["elo"])
+
+
+def build_single_feature_row(
+    df: pd.DataFrame,
+    feature_columns: list[str],
+    home_team: str,
+    away_team: str,
+    match_date: pd.Timestamp,
+    elo_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    Build a single-row feature DataFrame for a hypothetical match.
+    Uses historical matches before match_date.
+    """
+    row = pd.Series({
+        "date": match_date,
+        "home_team_api_id": home_team,
+        "away_team_api_id": away_team,
+    })
+
+    h_form = compute_team_form(df, home_team, match_date, n_matches=20)
+    a_form = compute_team_form(df, away_team, match_date, n_matches=20)
+    h2h = compute_h2h_features(df, home_team, away_team, match_date, n_matches=10)
+    h_style_matchup = compute_style_matchup(df, home_team, match_date, n_matches=20)
+    a_style_matchup = compute_style_matchup(df, away_team, match_date, n_matches=20)
+    h_style = get_style_stats(row, "h")
+    a_style = get_style_stats(row, "a")
+
+    feat = {}
+    for k, v in h_form.items():
+        feat[f"h_{k}"] = v
+    for k, v in a_form.items():
+        feat[f"a_{k}"] = v
+    feat.update(h2h)
+    feat.update(h_style)
+    feat.update(a_style)
+    for k, v in h_style_matchup.items():
+        feat[f"h_{k}"] = v
+    for k, v in a_style_matchup.items():
+        feat[f"a_{k}"] = v
+
+    if elo_df is not None:
+        h_elo = _lookup_latest_elo(elo_df, home_team, match_date)
+        a_elo = _lookup_latest_elo(elo_df, away_team, match_date)
+        if h_elo is not None:
+            feat["h_elo_hist"] = h_elo
+        if a_elo is not None:
+            feat["a_elo_hist"] = a_elo
+
+    feature_row = pd.DataFrame([feat])
+    for col in feature_columns:
+        if col not in feature_row.columns:
+            feature_row[col] = 0.0
+    feature_row = feature_row[feature_columns]
+    return feature_row
 
 
 # =============================================================================
@@ -1041,6 +1385,53 @@ def main():
     save_models(dnn_model, lstm_model)
 
     print("\nDone! All outputs saved.")
+
+    # ------------------------------------------------------------------
+    # 10. Single match prediction (optional)
+    # ------------------------------------------------------------------
+    try:
+        user_home = input("\nSingle match prediction? Enter HomeTeam (blank to skip): ")
+    except EOFError:
+        return
+    if user_home.strip():
+        user_away = input("Enter AwayTeam: ").strip()
+        user_date = input("Enter MatchDate (YYYY-MM-DD): ").strip()
+
+        home_team = _resolve_team_name(df, user_home)
+        away_team = _resolve_team_name(df, user_away)
+        match_date = pd.to_datetime(user_date, errors="coerce")
+
+        if home_team is None or away_team is None:
+            print("Invalid team name. Please check spelling.")
+            return
+        if pd.isna(match_date):
+            print("Invalid date format. Use YYYY-MM-DD.")
+            return
+
+        elo_df = None
+        if USE_ELO_RATINGS and os.path.exists(ELO_RATINGS_PATH):
+            try:
+                elo_df = load_elo_ratings(ELO_RATINGS_PATH)
+            except ValueError as exc:
+                print(str(exc))
+
+        feature_row = build_single_feature_row(
+            df,
+            feature_df.columns.tolist(),
+            home_team,
+            away_team,
+            match_date,
+            elo_df=elo_df,
+        )
+        X_single = data["scaler"].transform(feature_row.values.astype(float))
+        preds = dnn_model.predict(X_single, verbose=0)
+        prob = preds[0][0]
+        goals = preds[1][0]
+
+        print("\nPrediction (DNN):")
+        for label, p in zip(CLASS_NAMES, prob):
+            print(f"  {label}: {p:.3f}")
+        print(f"  Expected goals — Home: {goals[0]:.2f}, Away: {goals[1]:.2f}")
 
 
 if __name__ == "__main__":
